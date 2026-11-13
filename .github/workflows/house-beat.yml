@@ -1,0 +1,87 @@
+# House beat: reads a heartbeat sent by a private home system and sends ONE push if the beat goes quiet, one "back" line when it returns.
+# The heartbeat lives in the repository variable HOUSE_BEAT (not readable by the public). The push topic is the repository secret NTFY_TOPIC.
+# This repo is public only so the scheduled runs are free. It holds no data except a tiny alive/alert state file on the branch house-beat-state.
+# SHIPS OFF: the job runs only when the repository variable HOUSE_ALARM_ON is 'true'. A skipped job starts no runner. Undo: set it to false.
+# GITHUB_TOKEN cannot write repository variables, so the alert state lives in ONE small file on the branch house-beat-state
+# (created on the first run, committed only when it changed, never force-pushed).
+# Write access is on the job only; checkout keeps NO credential, so the step that holds NTFY_TOPIC has no git write token;
+# the two git steps that need GitHub pass the token as a one-off header. The save step runs always and retries its push 3 times.
+name: house-beat
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: house-beat
+  cancel-in-progress: false
+jobs:
+  beat:
+    if: ${{ vars.HOUSE_ALARM_ON == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Open the state branch (orphan on the first run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if git -c "http.extraheader=$AUTH" ls-remote --exit-code --heads origin house-beat-state >/dev/null 2>&1; then
+            git -c "http.extraheader=$AUTH" fetch --depth=1 origin house-beat-state
+            git worktree add --detach state-branch FETCH_HEAD
+          else
+            git worktree add --detach state-branch HEAD
+            git -C state-branch checkout --orphan house-beat-state
+            git -C state-branch rm -rf --quiet .
+          fi
+      - name: Check the beat (sends at most one message)
+        env:
+          HOUSE_BEAT: ${{ vars.HOUSE_BEAT }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          BEAT_STATE: state-branch/state/state.json
+        run: python outside_beat.py check
+      - name: Save the state only when it changed
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -d state-branch ] || { echo "no state worktree: nothing to save"; exit 0; }
+          cd state-branch
+          git add -A
+          if git diff --cached --quiet; then
+            echo "state unchanged"
+            exit 0
+          fi
+          git commit -q -m "house-beat state"
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          for try in 1 2 3; do
+            if git -c "http.extraheader=$AUTH" push origin HEAD:house-beat-state; then
+              echo "state saved (try $try)"
+              exit 0
+            fi
+            echo "push failed (try $try): pull --rebase, then again"
+            if git -c "http.extraheader=$AUTH" ls-remote --exit-code --heads origin house-beat-state >/dev/null 2>&1; then
+              git -c "http.extraheader=$AUTH" fetch --depth=1 origin house-beat-state
+              # shallow history cannot rebase cleanly: re-apply our one file on top of the remote tip (our state is the newer one)
+              cp state/state.json /tmp/state.mine.json
+              git reset -q --hard FETCH_HEAD
+              mkdir -p state
+              cp /tmp/state.mine.json state/state.json
+              git add -A
+              git diff --cached --quiet || git commit -q -m "house-beat state"
+            fi
+            sleep $((try * 3))
+          done
+          echo "state NOT saved after 3 tries" >&2
+          exit 1
